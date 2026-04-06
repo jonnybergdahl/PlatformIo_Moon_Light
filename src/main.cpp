@@ -276,7 +276,7 @@ void publishDiscovery() {
     if (!config.haDiscovery || !mqttClient.connected()) return;
 
     JsonDocument doc;
-    doc["name"]               = "Moon Phase";
+    doc["name"]               = "Moon Phase " + chipId;
     doc["unique_id"]          = "moonphase_" + chipId;
     doc["object_id"]          = "moonphase_" + chipId;
     doc["command_topic"]      = mqttCmdTopic;
@@ -284,10 +284,11 @@ void publishDiscovery() {
     doc["availability_topic"] = mqttAvailTopic;
     doc["schema"]             = "json";
     doc["brightness"]         = true;
+    doc["brightness_scale"]   = 100;
 
     JsonObject device = doc["device"].to<JsonObject>();
     device["identifiers"][0]  = "moonphase_" + chipId;
-    device["name"]            = "Moon Phase";
+    device["name"]            = "Moon Phase Light " + chipId;
     device["model"]           = "Moon Phase Light";
     device["manufacturer"]    = "DIY";
     device["sw_version"]      = __DATE__;
@@ -303,7 +304,7 @@ void publishState() {
 
     JsonDocument doc;
     doc["state"]        = lightOn ? "ON" : "OFF";
-    doc["brightness"]   = brightness;
+    doc["brightness"]   = (int)(brightness * 100.0 / config.brightness + 0.5);
     doc["moon_phase"]   = getMoonPhaseName(currentPhase);
     doc["illumination"] = ((int)(currentIllumination * 100.0 + 0.5)) / 100.0;
 
@@ -324,8 +325,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         Serial.printf("[mqtt] state -> %s\n", lightOn ? "ON" : "OFF");
     }
     if (doc["brightness"].is<int>()) {
-        brightness = min((uint8_t)doc["brightness"], config.brightness);
-        Serial.printf("[mqtt] brightness -> %d (max %d)\n", brightness, config.brightness);
+        int pct = doc["brightness"];
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        brightness = (uint8_t)(pct * config.brightness / 100);
+        Serial.printf("[mqtt] brightness -> %d%% = %d (max %d)\n", pct, brightness, config.brightness);
     }
 
     updateLEDs();
@@ -473,6 +477,13 @@ void setup() {
 
     Serial.println("[setup] buildTopics...");
     buildTopics();
+
+    String hostname = "moonphase-" + chipId;
+#ifdef ESP8266
+    WiFi.hostname(hostname);
+#else
+    WiFi.setHostname(hostname.c_str());
+#endif
 
     Serial.println("[setup] setupWiFi...");
     setupWiFi();
