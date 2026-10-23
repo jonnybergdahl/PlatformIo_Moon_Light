@@ -46,3 +46,6 @@
 
 # debug information files
 *.dwo
+
+# JetBrains
+.idea/

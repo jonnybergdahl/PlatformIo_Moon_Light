@@ -1,6 +1,6 @@
 /// Moon Phase Light
 ///
-/// Drives a 3-LED SK6812 WWA (Cool White / Warm White / Amber) strip
+/// Drives an SK6812 WWA (Cool White / Warm White / Amber) strip
 /// to display the current moon phase. Uses WiFiManager for provisioning
 /// and optionally publishes a Home Assistant light via MQTT discovery.
 
@@ -21,14 +21,16 @@
 // ---------------------------------------------------------------------------
 // Hardware
 // ---------------------------------------------------------------------------
-#ifdef ESP8266
-  #define LED_PIN       D1   // D1 on D1 Mini
-#elif defined(CONFIG_IDF_TARGET_ESP32S3)
-  #define LED_PIN       1   // GPIO1 on ESP32-S3 Super Mini
-#else
-  #define LED_PIN       5   // GPIO5 on ESP32 D1 Mini
+// LED_PIN and LED_COUNT are set per environment in platformio.ini
+#ifndef LED_PIN
+  #error "LED_PIN must be defined via build_flags in platformio.ini"
 #endif
-#define LED_COUNT       5
+#ifndef LED_COUNT
+  #define LED_COUNT     5
+#endif
+#ifndef FIRMWARE_VERSION
+  #define FIRMWARE_VERSION "dev"
+#endif
 
 // ---------------------------------------------------------------------------
 // SK6812 WWA channel mapping (GRB byte order on the wire)
@@ -44,12 +46,21 @@ Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 // ---------------------------------------------------------------------------
 // Networking
 // ---------------------------------------------------------------------------
-#define WIFI_AP_NAME    "MoonPhase-Setup"
-#define CONFIG_FILE     "/config.json"
+constexpr const char* WIFI_AP_NAME = "MoonPhase-Setup";
+constexpr const char* CONFIG_FILE  = "/config.json";
 
 // MQTT topics (chip-id is appended at runtime)
-#define MQTT_BASE_TOPIC     "moonphase"
-#define HA_DISCOVERY_PREFIX "homeassistant"
+constexpr const char* MQTT_BASE_TOPIC     = "moonphase";
+constexpr const char* HA_DISCOVERY_PREFIX = "homeassistant";
+
+// Timing (milliseconds)
+constexpr unsigned long MOON_UPDATE_INTERVAL_MS    = 60000UL;
+constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000UL;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS      = 10000UL;
+constexpr unsigned long PULSE_FRAME_INTERVAL_MS    = 20UL;   // ~50 fps
+
+// Any time before this means NTP has not synced yet (2001-09-09)
+constexpr time_t MIN_VALID_TIME = 1000000000L;
 
 WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -81,7 +92,7 @@ double   currentIllumination = 0.0;
 
 unsigned long lastMoonUpdate      = 0;
 unsigned long lastMqttReconnect   = 0;
-bool          mqttWasConnected    = false;
+bool          mqttConfigChanged   = false;  // set by the portal, handled in loop()
 
 // Derived at startup from ESP.getChipId()
 String chipId;
@@ -97,6 +108,8 @@ String haDiscoveryTopic;
 void loadConfig();
 void saveConfig();
 void buildTopics();
+bool mqttConfigured();
+void setupMqtt();
 double getMoonPhase();
 double getMoonIllumination(double phase);
 const char* getMoonPhaseName(double phase);
@@ -169,9 +182,8 @@ void buildTopics() {
 /// Returns the moon phase as a value in [0, 1).
 /// 0.0 = new moon, ~0.5 = full moon, approaching 1.0 = next new moon.
 double getMoonPhase() {
-    time_t now;
-    time(&now);
-    if (now < 1000000000L) return 0.0;   // NTP not synced yet
+    time_t now = time(nullptr);
+    if (now < MIN_VALID_TIME) return 0.0;   // NTP not synced yet
 
     // Reference new moon: 2000-01-06 18:14 UTC  (Unix 947182440)
     const double refNewMoon   = 947182440.0;
@@ -180,10 +192,6 @@ double getMoonPhase() {
     double elapsed = (double)now - refNewMoon;
     double phase   = fmod(elapsed, synodicMonth) / synodicMonth;
     if (phase < 0.0) phase += 1.0;
-
-    double illum = 0.5 * (1.0 - cos(2.0 * M_PI * phase));
-    Serial.printf("[moon] time=%lu phase=%.4f illum=%.4f name=%s\n",
-                  (unsigned long)now, phase, illum, getMoonPhaseName(phase));
     return phase;
 }
 
@@ -218,6 +226,12 @@ static inline void setPixelWWA(uint8_t pixel,
 
 /// Pulsing effect for startup states. Uses a sine wave for smooth breathing.
 void pulseLEDs(uint8_t warmWhite, uint8_t coolWhite, uint8_t amber) {
+    // Throttle updates: strip.show() briefly disables interrupts, and
+    // calling it on every loop() iteration starves the WiFi stack.
+    static unsigned long lastFrame = 0;
+    if (millis() - lastFrame < PULSE_FRAME_INTERVAL_MS) return;
+    lastFrame = millis();
+
     double t = (millis() % 2000) / 2000.0;          // 0..1 over 2 seconds
     double pulse = 0.5 * (1.0 - cos(2.0 * M_PI * t)); // smooth 0..1..0
     double maxScale = config.brightness / 255.0;
@@ -231,16 +245,18 @@ void pulseLEDs(uint8_t warmWhite, uint8_t coolWhite, uint8_t amber) {
 }
 
 void updateLEDs() {
+    double phase = getMoonPhase();
+    double illum = getMoonIllumination(phase);
+    currentPhase        = phase;
+    currentIllumination = illum;
+    Serial.printf("[moon] phase=%.4f illum=%.4f name=%s\n",
+                  phase, illum, getMoonPhaseName(phase));
+
     if (!lightOn) {
         strip.clear();
         strip.show();
         return;
     }
-
-    double phase = getMoonPhase();
-    double illum = getMoonIllumination(phase);
-    currentPhase        = phase;
-    currentIllumination = illum;
 
     double scale = brightness / 255.0;
 
@@ -278,7 +294,7 @@ void publishDiscovery() {
     JsonDocument doc;
     doc["name"]               = "Moon Phase " + chipId;
     doc["unique_id"]          = "moonphase_" + chipId;
-    doc["object_id"]          = "moonphase_" + chipId;
+    doc["default_entity_id"]  = "light.moonphase_" + chipId;
     doc["command_topic"]      = mqttCmdTopic;
     doc["state_topic"]        = mqttStateTopic;
     doc["availability_topic"] = mqttAvailTopic;
@@ -291,12 +307,17 @@ void publishDiscovery() {
     device["name"]            = "Moon Phase Light " + chipId;
     device["model"]           = "Moon Phase Light";
     device["manufacturer"]    = "DIY";
-    device["sw_version"]      = __DATE__;
+    device["sw_version"]      = FIRMWARE_VERSION;
+    // Shown as the "Visit" link on the HA device page (WiFiManager portal)
+    device["configuration_url"] = "http://" + WiFi.localIP().toString() + "/";
 
-    char buf[600];
-    serializeJson(doc, buf, sizeof(buf));
-    Serial.printf("[mqtt] discovery -> %s\n", haDiscoveryTopic.c_str());
-    mqttClient.publish(haDiscoveryTopic.c_str(), buf, true);
+    String payload;
+    serializeJson(doc, payload);
+    Serial.printf("[mqtt] discovery -> %s (%u bytes)\n",
+                  haDiscoveryTopic.c_str(), payload.length());
+    if (!mqttClient.publish(haDiscoveryTopic.c_str(), payload.c_str(), true)) {
+        Serial.println("[mqtt] discovery publish FAILED (payload too large?)");
+    }
 }
 
 void publishState() {
@@ -304,7 +325,10 @@ void publishState() {
 
     JsonDocument doc;
     doc["state"]        = lightOn ? "ON" : "OFF";
-    doc["brightness"]   = (int)(brightness * 100.0 / config.brightness + 0.5);
+    // Brightness is reported as a percentage of the configured maximum
+    doc["brightness"]   = config.brightness > 0
+                          ? (int)(brightness * 100.0 / config.brightness + 0.5)
+                          : 0;
     doc["moon_phase"]   = getMoonPhaseName(currentPhase);
     doc["illumination"] = ((int)(currentIllumination * 100.0 + 0.5)) / 100.0;
 
@@ -312,6 +336,28 @@ void publishState() {
     serializeJson(doc, buf, sizeof(buf));
     Serial.printf("[mqtt] state -> %s: %s\n", mqttStateTopic.c_str(), buf);
     mqttClient.publish(mqttStateTopic.c_str(), buf, true);
+}
+
+bool mqttConfigured() {
+    return config.mqttEnabled && config.mqttHost[0] != '\0';
+}
+
+/// (Re)applies the MQTT settings. Safe to call again after the portal
+/// changed the configuration.
+void setupMqtt() {
+    if (mqttClient.connected()) {
+        mqttClient.publish(mqttAvailTopic.c_str(), "offline", true);
+        mqttClient.disconnect();
+    }
+    if (!mqttConfigured()) {
+        Serial.println("[mqtt] disabled");
+        return;
+    }
+    mqttClient.setServer(config.mqttHost, config.mqttPort);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(1024);
+    lastMqttReconnect = millis() - MQTT_RECONNECT_INTERVAL_MS;  // connect right away
+    Serial.printf("[mqtt] enabled -> %s:%u\n", config.mqttHost, config.mqttPort);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -337,11 +383,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void mqttReconnect() {
-    if (!config.mqttEnabled || strlen(config.mqttHost) == 0) return;
-    if (mqttClient.connected()) return;
+    if (!mqttConfigured() || mqttClient.connected()) return;
 
     unsigned long now = millis();
-    if (now - lastMqttReconnect < 5000) return;
+    if (now - lastMqttReconnect < MQTT_RECONNECT_INTERVAL_MS) return;
     lastMqttReconnect = now;
 
     Serial.print("MQTT connecting to ");
@@ -365,7 +410,6 @@ void mqttReconnect() {
         mqttClient.subscribe(mqttCmdTopic.c_str());
         publishDiscovery();
         publishState();
-        mqttWasConnected = true;
     } else {
         Serial.print("MQTT failed, rc=");
         Serial.println(mqttClient.state());
@@ -399,6 +443,7 @@ void saveParamsCallback() {
     config.brightness = (bri < 0) ? 0 : (bri > 255) ? 255 : (uint8_t)bri;
     brightness = min(brightness, config.brightness);
     saveConfig();
+    mqttConfigChanged = true;
     Serial.println("Config saved");
 }
 
@@ -455,7 +500,7 @@ void setupWiFi() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n\n=== Moon Phase ===");
+    Serial.printf("\n\n=== Moon Phase %s ===\n", FIRMWARE_VERSION);
 
     Serial.println("[setup] LED init...");
     strip.begin();
@@ -464,12 +509,13 @@ void setup() {
 
     Serial.println("[setup] LittleFS...");
 #ifdef ESP8266
-    LittleFS.begin();
+    const bool fsOk = LittleFS.begin();       // auto-formats on failure
 #else
-    if (!LittleFS.begin(true)) {
+    const bool fsOk = LittleFS.begin(true);   // format on failure
+#endif
+    if (!fsOk) {
         Serial.println("[setup] LittleFS mount FAILED");
     }
-#endif
 
     Serial.println("[setup] loadConfig...");
     loadConfig();
@@ -496,10 +542,11 @@ void loop() {
 
     // Heartbeat every 10 seconds
     static unsigned long lastHeartbeat = 0;
-    if (now - lastHeartbeat >= 10000UL) {
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeat = now;
-        Serial.printf("[loop] alive, heap=%u, wifi=%d, state=%d\n",
-                      ESP.getFreeHeap(), WiFi.status(), startupState);
+        Serial.printf("[loop] alive, heap=%lu, wifi=%d, state=%d\n",
+                      (unsigned long)ESP.getFreeHeap(), (int)WiFi.status(),
+                      (int)startupState);
     }
 
     // -- Startup state machine ------------------------------------------
@@ -515,19 +562,13 @@ void loop() {
 
     if (startupState == STARTUP_NTP) {
         pulseLEDs(0, 0, 200);   // Amber pulse
-        time_t t;
-        time(&t);
-        if (t > 1000000000L) {
+        if (time(nullptr) >= MIN_VALID_TIME) {
             Serial.println("[startup] NTP synced, starting normal operation");
             // Init MQTT now that we have network + time
-            if (config.mqttEnabled && strlen(config.mqttHost) > 0) {
-                mqttClient.setServer(config.mqttHost, config.mqttPort);
-                mqttClient.setCallback(mqttCallback);
-                mqttClient.setBufferSize(1024);
-                Serial.printf("[startup] MQTT enabled -> %s:%u\n",
-                              config.mqttHost, config.mqttPort);
-            }
+            setupMqtt();
+            mqttConfigChanged = false;
             updateLEDs();
+            lastMoonUpdate = now;
             startupState = STARTUP_READY;
         }
         return;
@@ -535,16 +576,23 @@ void loop() {
 
     // -- Normal operation -----------------------------------------------
 
+    // Settings changed in the portal: apply new brightness and MQTT config
+    if (mqttConfigChanged) {
+        mqttConfigChanged = false;
+        setupMqtt();
+        updateLEDs();
+    }
+
     // MQTT housekeeping
-    if (config.mqttEnabled && strlen(config.mqttHost) > 0) {
+    if (mqttConfigured()) {
         if (!mqttClient.connected()) {
             mqttReconnect();
         }
         mqttClient.loop();
     }
 
-    // Recalculate moon phase every 60 seconds
-    if (now - lastMoonUpdate >= 60000UL) {
+    // Recalculate moon phase periodically
+    if (now - lastMoonUpdate >= MOON_UPDATE_INTERVAL_MS) {
         lastMoonUpdate = now;
         double prevIllum = currentIllumination;
         updateLEDs();

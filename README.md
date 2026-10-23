@@ -27,6 +27,8 @@ The SK6812 WWA uses the GRB protocol with the following physical mapping:
 | G             | Amber       |
 | B             | Warm White  |
 
+The LED pin and LED count are set per environment via `build_flags` (`-DLED_PIN`, `-DLED_COUNT`) in `platformio.ini`.
+
 If your strip has a different channel order, adjust the `setPixelWWA()` function in `src/main.cpp`.
 
 ## Features
@@ -48,7 +50,7 @@ If your strip has a different channel order, adjust the `setPixelWWA()` function
 
 ### Build & Flash
 
-This is a [PlatformIO](https://platformio.org/) project. Build and upload for a specific board:
+This is a [PlatformIO](https://platformio.org/) project (PlatformIO Core 6.2+, `espressif32` platform 8.x / Arduino core 3.3, `espressif8266` platform 4.2). Build and upload for a specific board:
 
 ```bash
 pio run -e d1_mini -t upload
@@ -97,7 +99,9 @@ When MQTT is enabled, the device:
 - Accepts **on/off** and **brightness** commands (brightness is capped to the configured max).
 - Reports **moon phase** name and **illumination** percentage as part of the state payload.
 
-When **Use HA Discovery** is also enabled, the device publishes a [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) config for a **light** entity in Home Assistant.
+When **Use HA Discovery** is also enabled, the device publishes a [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) config for a **light** entity in Home Assistant. The discovery payload includes a `configuration_url`, so the **Visit** link on the HA device page opens the device's web portal.
+
+Settings saved in the portal (including MQTT changes) are applied right away, without a reboot.
 
 ### MQTT Topics
 
